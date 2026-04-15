@@ -17,6 +17,7 @@ from typing import Literal
 from copy import deepcopy
 import inspect
 
+from refAV.agentic_st_visual import get_scene_visual_stats
 from refAV.utils import (
     cache_manager, composable, composable_relational, #global cache_manager and decorators
     get_cuboid_from_uuid, get_ego_SE3, get_ego_uuid,
@@ -252,6 +253,37 @@ def is_color(
 
 
 @composable
+@cache_manager.create_cache('is_snowy_scene')
+def is_snowy_scene(
+    track_candidates: dict,
+    log_dir: Path,
+    camera_name: str = "ring_front_center",
+    snow_score_thresh: float = 0.58,
+) -> dict:
+    """
+    Returns timestamps where the surrounding camera imagery looks visually snowy.
+
+    Args:
+        track_candidates: The objects you want to filter from (scenario dictionary).
+        log_dir: Path to scenario logs.
+        camera_name: Camera used to estimate snowiness.
+        snow_score_thresh: Minimum snow score for keeping a timestamp.
+
+    Returns:
+        dict:
+            A filtered scenario dictionary of timestamps whose scene imagery has a high snow score.
+    """
+    track_uuid = track_candidates
+    timestamps = get_timestamps(track_uuid, log_dir)
+    snowy_timestamps = []
+    for timestamp in timestamps:
+        stats = get_scene_visual_stats(log_dir, int(timestamp), camera_name)
+        if stats.get("snow_score", 0.0) >= snow_score_thresh:
+            snowy_timestamps.append(timestamp)
+    return snowy_timestamps
+
+
+@composable
 @cache_manager.create_cache('within_camera_view')
 def within_camera_view(
     track_candidates: dict,
@@ -315,8 +347,8 @@ def turning(
         print("Specified direction must be 'left', 'right', or None. Direction set to \
               None automatically.")
     
-    TURN_ANGLE_THRESH = 45 #degrees 
-    ANG_VEL_THRESH = 5 #deg/s
+    TURN_ANGLE_THRESH = 30 #degrees
+    ANG_VEL_THRESH = 3 #deg/s
 
     ang_vel, timestamps = get_nth_yaw_deriv(track_uuid, 1, log_dir, coordinate_frame='self', in_degrees=True)
 
@@ -1617,12 +1649,117 @@ def scenario_not(func):
     return wrapper
 
 
+def union(source_dict: dict, related_dict: dict, log_dir: Path) -> dict:
+    """Merge two scenario dicts by taking the union of all tracks and their timestamps.
+
+    Use this to express OR conditions between two parallel filter chains, e.g. vehicles
+    that are EITHER turning OR accelerating.  Both inputs must be flat scenario dicts
+    (output of unary filter operations).  Relational (nested) dicts are not supported.
+
+    Args:
+        source_dict: First scenario dictionary {track_uuid: [timestamp_ns, ...]}.
+        related_dict: Second scenario dictionary {track_uuid: [timestamp_ns, ...]}.
+        log_dir: Path to scenario logs (unused; kept for API consistency).
+
+    Returns:
+        dict: Merged scenario dictionary.  For tracks present in both inputs the
+              timestamp lists are unioned.  Tracks unique to either input are
+              included as-is.
+
+    Example:
+        turning_or_accelerating = union(turning_vehicles, accelerating_vehicles, log_dir)
+        left_or_right_lane_change = union(lane_change_left, lane_change_right, log_dir)
+    """
+    def _is_relational(d: dict) -> bool:
+        return any(isinstance(v, dict) for v in d.values())
+
+    if _is_relational(source_dict) or _is_relational(related_dict):
+        raise ValueError(
+            "union() received a relational (nested) scenario dict. Binary predicates "
+            "like heading_toward, has_objects_in_relative_direction, and near_objects "
+            "already attach related objects as nested metadata. Do not union their "
+            "output with the related category — return the predicate output directly."
+        )
+
+    result: dict = {}
+    for track_uuid, entry in source_dict.items():
+        result[track_uuid] = list(get_scenario_timestamps(entry))
+    for track_uuid, entry in related_dict.items():
+        ts = list(get_scenario_timestamps(entry))
+        if track_uuid in result:
+            result[track_uuid] = sorted(set(result[track_uuid]) | set(ts))
+        else:
+            result[track_uuid] = sorted(ts)
+    return result
+
+
+def within_time_window(
+    track_candidates: dict,
+    log_dir: Path,
+    window_seconds: float = 15.0,
+    min_events: int = 2,
+    event_gap_seconds: float = 0.5,
+) -> dict:
+    """
+    Keep tracks whose upstream-filtered timestamps form at least `min_events`
+    distinct event segments whose start times all fall within `window_seconds`
+    of each other. Use for prompts like "two right turns within 15 seconds":
+    pipe the event filter (turning, accelerating, ...) as source, then apply
+    this op to require repetition inside a temporal window.
+
+    Args:
+        track_candidates: flat scenario dict from an upstream unary filter.
+        log_dir: log directory (unused, kept for DSL uniformity).
+        window_seconds: max time span between the first and last event starts.
+        min_events: number of distinct event segments required.
+        event_gap_seconds: gap (s) separating two distinct event segments.
+    """
+    def _is_relational(d: dict) -> bool:
+        return any(isinstance(v, dict) for v in d.values())
+
+    if not isinstance(track_candidates, dict):
+        return {}
+    if _is_relational(track_candidates):
+        raise ValueError(
+            "within_time_window() received a relational (nested) scenario dict. "
+            "Pipe a unary event filter (turning, accelerating, ...) as its source."
+        )
+
+    gap_ns = int(event_gap_seconds * 1e9)
+    window_ns = int(window_seconds * 1e9)
+    result: dict = {}
+    for track_uuid, ts_list in track_candidates.items():
+        timestamps = sorted(int(t) for t in (ts_list or []))
+        if len(timestamps) < min_events:
+            continue
+        events: list[list[int]] = []
+        current = [timestamps[0]]
+        for t in timestamps[1:]:
+            if t - current[-1] > gap_ns:
+                events.append(current)
+                current = [t]
+            else:
+                current.append(t)
+        events.append(current)
+        if len(events) < min_events:
+            continue
+        kept: list[int] = []
+        for i in range(len(events) - min_events + 1):
+            if events[i + min_events - 1][0] - events[i][0] <= window_ns:
+                for ev in events[i:i + min_events]:
+                    kept.extend(ev)
+                break
+        if kept:
+            result[track_uuid] = sorted(set(kept))
+    return result
+
+
 def output_scenario(
     scenario:dict,
-    description:str, 
-    log_dir:Path, 
-    output_dir:Path, 
-    visualize:bool=False, 
+    description:str,
+    log_dir:Path,
+    output_dir:Path,
+    visualize:bool=False,
     **visualization_kwargs):
     """
     Outputs a file containing the predictions in an evaluation-ready format. Do not provide any visualization kwargs. 
@@ -1649,4 +1786,3 @@ def output_scenario(
         visualize_scenario(scenario, log_dir, log_scenario_visualization_path, description=description, **visualization_kwargs)
 
     
-

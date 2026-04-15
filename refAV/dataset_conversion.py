@@ -66,7 +66,7 @@ def separate_scenario_mining_annotations(input_feather_path, base_annotation_dir
         filtered_data = log_data.drop(columns=exclude_columns)
 
         # Save to a feather file
-        output_path = log_dir / "sm_annotations.feather"
+        output_path = log_dir / "annotations.feather"
         filtered_data.to_feather(output_path)
         print(f"Saved {output_path}")
 
@@ -271,7 +271,7 @@ def process_sequences(log_id, track_data, dataset_dir, base_output_dir, filter=T
         log_dir = base_output_dir / str(log_id)
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        output_path = log_dir / "sm_annotations.feather"
+        output_path = log_dir / "annotations.feather"
         df.to_feather(output_path)
         # print(f"Created feather file: {output_path}")
 
@@ -309,7 +309,7 @@ def pickle_to_feather(dataset_dir, input_pickle_path, base_output_dir="output"):
 def add_ego_to_annotation(log_dir: Path, output_dir: Path = Path("output")):
 
     split = get_log_split(log_dir)
-    annotations_df = read_feather(log_dir / "sm_annotations.feather")
+    annotations_df = read_feather(log_dir / "annotations.feather")
     ego_df = read_feather(
         AV2_DATA_DIR / split / log_dir.name / "city_SE3_egovehicle.feather"
     )
@@ -335,7 +335,7 @@ def add_ego_to_annotation(log_dir: Path, output_dir: Path = Path("output")):
     ego_df = ego_df[ego_df["timestamp_ns"].isin(synchronized_timestamps)]
 
     combined_df = pd.concat([annotations_df, ego_df], ignore_index=True)
-    feather.write_feather(combined_df, output_dir / "sm_annotations.feather")
+    feather.write_feather(combined_df, output_dir / "annotations.feather")
     # print(f'Successfully added ego to annotations for log {log_dir.name}.')
 
 
@@ -372,6 +372,7 @@ def convert_log_prompt_df(
     prompt,
     lpp_df,
     output_dir,
+    source_log_root=None,
 ):
     """Process a single log_id and prompt combination."""
     output_path = output_dir / log_id / f"{prompt}.pkl"
@@ -382,13 +383,16 @@ def convert_log_prompt_df(
     frames = []
 
     split = get_log_split(Path(log_id))
-    log_dir = SM_DATA_DIR / split / log_id
+    staged_log_dir = Path(output_dir) / log_id
+    default_log_dir = SM_DATA_DIR / split / log_id
+    log_dir = staged_log_dir if (staged_log_dir / "annotations.feather").exists() else default_log_dir
+    source_log_dir = Path(source_log_root) / log_id if source_log_root is not None else log_dir
     (output_dir / log_id).mkdir(exist_ok=True)
 
-    annotations = read_feather(log_dir / "sm_annotations.feather")
+    annotations = read_feather(log_dir / "annotations.feather")
     log_timestamps = np.sort(annotations["timestamp_ns"].unique())
     all_uuids = list(annotations["track_uuid"].unique())
-    ego_poses = get_ego_SE3(log_dir)
+    ego_poses = get_ego_SE3(source_log_dir)
 
     referred_objects = mining_category_from_df(lpp_df, "REFERRED_OBJECT")
     related_objects = mining_category_from_df(lpp_df, "RELATED_OBJECT")
@@ -467,7 +471,7 @@ def convert_log_prompt_df(
 
 
 def create_gt_mining_pkls_parallel(
-    scenario_mining_annotations_path, output_dir: Path, num_processes=None
+    scenario_mining_annotations_path, output_dir: Path, num_processes=None, source_log_root=None
 ):
     """
     Generates both a pkl file for evaluation in parallel.
@@ -478,18 +482,18 @@ def create_gt_mining_pkls_parallel(
         num_processes: Number of CPU cores to use (None = use all available)
     """
 
-    sm_annotations = read_feather(scenario_mining_annotations_path)
-    log_ids = sm_annotations["log_id"].unique()
+    annotations = read_feather(scenario_mining_annotations_path)
+    log_ids = annotations["log_id"].unique()
 
     # Create a list of (log_id, prompt, filtered_df) tuples to process
     tasks = []
     for log_id in tqdm(log_ids, desc="Separating annotation file"):
-        log_df = sm_annotations[sm_annotations["log_id"] == log_id]
+        log_df = annotations[annotations["log_id"] == log_id]
         (output_dir / log_id).mkdir(exist_ok=True)
         prompts = log_df["prompt"].unique()
         for prompt in prompts:
             lpp_df = log_df[log_df["prompt"] == prompt]
-            tasks.append((log_id, prompt, lpp_df, output_dir))
+            tasks.append((log_id, prompt, lpp_df, output_dir, source_log_root))
 
     # If num_processes is not specified, use all available cores
     if num_processes is None:

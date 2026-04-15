@@ -107,7 +107,7 @@ def create_default_prediction(description: str, log_dir: Path, output_dir: Path)
     empty_set = {}
     output_scenario(empty_set, description, log_dir, output_dir, visualize=False)
 
-    pred_path = output_dir / log_id / f"{description}_predictions.pkl"
+    pred_path = output_dir / log_dir.name / f"{description}_predictions.pkl"
     if pred_path.exists():
         print("Default scenario prediction correctly generated.")
     else:

@@ -69,15 +69,40 @@ class CacheManager:
             self.stats[name] = {'hits': 0, 'misses': 0}
         
         def decorator(func):
+            cache = self.caches[name]
             @wraps(func)
             def wrapper(*args, **kwargs):
-                key = (
-                    self.make_hashable(args),
-                    self.make_hashable(kwargs)
-                )
+                def _to_hashable(v):
+                    import pyarrow as pa
+                    try:
+                        import pandas as pd
+                    except ImportError:
+                        pd = None
+
+                    if isinstance(v, (pa.Array, pa.ChunkedArray)):
+                        return tuple(v.to_pylist())
+                    if pd is not None and isinstance(v, (pd.Series, pd.Index)):
+                        return tuple(v.tolist())
+                    if pd is not None and isinstance(v, pd.api.extensions.ExtensionArray):
+                        return tuple(v.tolist())
+                    normalized = self.make_hashable(v)
+                    if normalized is not v:
+                        return normalized
+                    if isinstance(v, (list, tuple)):
+                        return tuple(_to_hashable(x) for x in v)
+                    if isinstance(v, set):
+                        return tuple(sorted(_to_hashable(x) for x in v))
+                    if isinstance(v, dict):
+                        return tuple(sorted((k, _to_hashable(val)) for k, val in v.items()))
+                    if isinstance(v, np.ndarray):
+                        return tuple(v.flatten().tolist())
+                    if isinstance(v, Path):
+                        return str(v)
+                    return v
                 
-                cache:OrderedDict = self.caches[name]
-                
+                hashable_args = tuple(_to_hashable(a) for a in args)
+                hashable_kwargs = tuple(sorted((k, _to_hashable(v)) for k, v in kwargs.items()))
+                key = (hashable_args, hashable_kwargs)
                 if key in cache:
                     cache.move_to_end(key)
                     self.stats[name]['hits'] += 1
@@ -166,6 +191,22 @@ class CacheManager:
         
 cache_manager = CacheManager()
 
+# Module-level cache so SynchronizationDB is built ONCE per log_dir.
+# Without this every call to get_img_crop/get_all_crops/etc. constructs a fresh
+# EasyDataLoader → fresh SynchronizationDB → walks every camera directory. That
+# is the dominant per-scenario cost (minutes).
+_LOADER_CACHE: dict[str, "EasyDataLoader"] = {}
+
+
+def get_cached_loader(log_dir: Path) -> "EasyDataLoader":
+    key = str(Path(log_dir))
+    loader = _LOADER_CACHE.get(key)
+    if loader is None:
+        loader = EasyDataLoader(Path(log_dir))
+        _LOADER_CACHE[key] = loader
+    return loader
+
+
 class EasyDataLoader(AV2SensorDataLoader):
     """Dataloader to load both NuScenes and AV2 data given only a log_id"""
 
@@ -175,7 +216,7 @@ class EasyDataLoader(AV2SensorDataLoader):
         split = get_log_split(log_dir)
 
         if dataset == 'AV2':
-            data_dir = paths.AV2_DATA_DIR / split 
+            data_dir = paths.AV2_DATA_DIR / split
             labels_dir = log_dir.parent
         elif dataset == 'NUSCENES':
             data_dir = paths.NUSCENES_AV2_DATA_DIR / split
@@ -323,8 +364,12 @@ def remove_nonintersecting_timestamps(dict1:dict[str,list], dict2:dict[str,list]
 
 @cache_manager.create_cache('get_ego_uuid')
 def get_ego_uuid(log_dir):
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     ego_df = df[df['category'] == 'EGO_VEHICLE']
+    if ego_df.empty:
+        # Some AV2 logs do not include a synthetic ego annotation row.
+        # RefAV uses "ego" as the canonical fallback identifier.
+        return 'ego'
     return ego_df['track_uuid'].iloc[0]
 
 
@@ -352,7 +397,7 @@ def get_uuids_of_category(log_dir:Path, category:str):
         trucks = get_uuids_of_category(log_dir, category='TRUCK')
     """
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
 
     if category == 'ANY':
         uuids = df['track_uuid'].unique()
@@ -369,12 +414,22 @@ def get_uuids_of_category(log_dir:Path, category:str):
         category_df = df[df['category'] == category]
         uuids = category_df['track_uuid'].unique()
 
+    if hasattr(uuids, "tolist"):
+        uuids = uuids.tolist()
+    else:
+        uuids = list(uuids)
+
+    # AV2 annotation feathers do not always contain an explicit EGO_VEHICLE row.
+    # Fall back to the canonical ego identifier so scene-level predicates
+    # (is_snowy_scene, has_velocity, within_camera_view, ...) still fire on ego.
+    if category == 'EGO_VEHICLE' and len(uuids) == 0:
+        uuids = [get_ego_uuid(log_dir)]
     return uuids
 
 
 def has_free_will(track_uuid, log_dir):
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     category = df[df['track_uuid'] == track_uuid]['category'].iloc[0]
     if category in ['ANIMAL','OFFICIAL_SIGNALER','RAILED_VEHICLE','ARTICULATED_BUS','WHEELED_RIDER','SCHOOL_BUS',
                     'MOTORCYCLIST','TRUCK_CAB','VEHICULAR_TRAILER','BICYCLIST','MOTORCYCLE','TRUCK','BOX_TRUCK','BUS',
@@ -387,10 +442,14 @@ def has_free_will(track_uuid, log_dir):
 @composable
 def get_object(track_uuid, log_dir):
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     track_df = df[df['track_uuid'] == track_uuid]
 
     if track_df.empty:
+        # Synthetic ego fallback: see get_timestamps() and get_nth_pos_deriv()
+        # — AV2 annotation feathers often omit the ego row.
+        if track_uuid == get_ego_uuid(log_dir) or track_uuid == 'ego':
+            return sorted(get_log_timestamps(log_dir))
         print(f'Given track_uuid {track_uuid} not in log annotations.')
         return []
     else:
@@ -443,7 +502,7 @@ def get_img_crops(track_uuid, log_dir:Path)->dict[str,dict[int,tuple[int,int,int
     """
 
     split = get_log_split(log_dir)
-    dataloader = EasyDataLoader(log_dir.parent)
+    dataloader = get_cached_loader(log_dir.parent)
     camera_names = get_camera_names(log_dir)
     timestamps = (track_uuid, log_dir)
 
@@ -510,7 +569,7 @@ def get_all_crops(log_dir:Path, timestamps=None, track_uuids=None)->dict[str,dic
             img_crops = json.load(file)
         return img_crops
 
-    dataloader = EasyDataLoader(log_dir)
+    dataloader = get_cached_loader(log_dir)
     camera_names = get_camera_names(log_dir)
 
     if timestamps is None:
@@ -672,7 +731,7 @@ def get_best_crop(track_uuid, log_dir)->dict:
 @cache_manager.create_cache('get_img_crop')
 def get_img_crop(camera, timestamp, log_dir:Path, box=None):
 
-    dataloader = EasyDataLoader(log_dir)
+    dataloader = get_cached_loader(log_dir)
     img_path = dataloader.get_closest_img_fpath(log_dir.name, camera, timestamp)
 
     if img_path is None:
@@ -865,21 +924,27 @@ def construct_caches(log_dirs: list[Path], num_processes: int = None):
 
         # Phase 2c: Single SigLIP pipeline on batched crop file paths
         if image_batches:
-            pipe = pipeline(
-                model="google/siglip2-so400m-patch16-naflex",
-                task="zero-shot-image-classification",
-                device_map="auto",
-                dtype="auto",
-                batch_size=256
-            )
-            for image_batch, batch_info in tqdm(
-                zip(image_batches, info_batches),
-                total=len(image_batches),
-                desc="Running color classification"
-            ):
-                colors = get_clip_colors(image_batch, possible_colors, pipe=pipe)
-                for color, (log_dir_str, track_uuid) in zip(colors, batch_info):
-                    color_caches[log_dir_str][track_uuid] = color
+            try:
+                pipe = pipeline(
+                    model="google/siglip2-so400m-patch16-naflex",
+                    task="zero-shot-image-classification",
+                    device_map="auto",
+                    dtype="auto",
+                    batch_size=256
+                )
+                for image_batch, batch_info in tqdm(
+                    zip(image_batches, info_batches),
+                    total=len(image_batches),
+                    desc="Running color classification"
+                ):
+                    colors = get_clip_colors(image_batch, possible_colors, pipe=pipe)
+                    for color, (log_dir_str, track_uuid) in zip(colors, batch_info):
+                        color_caches[log_dir_str][track_uuid] = color
+            except Exception as exc:
+                print(f"[warn] Color cache construction skipped: {exc}")
+                for batch_info in info_batches:
+                    for log_dir_str, track_uuid in batch_info:
+                        color_caches[log_dir_str][track_uuid] = None
 
         for log_dir_str, color_cache in color_caches.items():
             cache_dir = Path(log_dir_str) / 'cache'
@@ -893,10 +958,14 @@ def construct_caches(log_dirs: list[Path], num_processes: int = None):
 @cache_manager.create_cache('get_timestamps')
 def get_timestamps(track_uuid, log_dir):
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     track_df = df[df['track_uuid'] == track_uuid]
 
     if track_df.empty:
+        # Synthetic ego fallback: some AV2 logs have no EGO_VEHICLE annotation row,
+        # so return the full set of log timestamps for the canonical ego uuid.
+        if track_uuid == get_ego_uuid(log_dir) or track_uuid == 'ego':
+            return sorted(get_log_timestamps(log_dir))
         print(f'Given track_uuid {track_uuid} not in log annotations.')
         return []
     else:
@@ -905,7 +974,7 @@ def get_timestamps(track_uuid, log_dir):
 
 
 def get_log_timestamps(log_dir):
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     timestamps = df['timestamp_ns'].unique()
     return sorted(timestamps)
 
@@ -1325,23 +1394,33 @@ def polygons_overlap(poly1, poly2):
 
 @cache_manager.create_cache('get_nth_pos_deriv')
 def get_nth_pos_deriv(
-    track_uuid, 
-    n, 
-    log_dir, 
+    track_uuid,
+    n,
+    log_dir,
     coordinate_frame=None,
     direction='forward') -> tuple[np.ndarray, list[int]]:
 
-    """Returns the nth positional derivative of the track at all timestamps 
+    """Returns the nth positional derivative of the track at all timestamps
     with respect to city coordinates. """
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     ego_poses = get_ego_SE3(log_dir)
 
     # Filter the DataFrame
     cuboid_df = df[df['track_uuid'] == track_uuid]
-    ego_coords = cuboid_df[['tx_m', 'ty_m', 'tz_m']].to_numpy()
 
-    timestamps = cuboid_df['timestamp_ns'].to_numpy()
+    # Synthetic ego fallback: AV2 annotation feathers often omit the ego row.
+    # Use the city_SE3_egovehicle pose trajectory so pos/velocity queries on
+    # the ego work identically to those on annotated tracks.
+    if cuboid_df.empty and (track_uuid == get_ego_uuid(log_dir) or track_uuid == 'ego'):
+        pose_timestamps = sorted(ego_poses.keys())
+        timestamps = np.array(pose_timestamps, dtype=np.int64)
+        # In the ego's own frame the ego is at the origin; transform_from
+        # below will map these to city coords via ego_poses[t].
+        ego_coords = np.zeros((len(pose_timestamps), 3), dtype=np.float64)
+    else:
+        ego_coords = cuboid_df[['tx_m', 'ty_m', 'tz_m']].to_numpy()
+        timestamps = cuboid_df['timestamp_ns'].to_numpy()
     city_coords = np.zeros((ego_coords.shape)).T
     for i in range(len(ego_coords)):
         city_coords[:,i] = ego_poses[timestamps[i]].transform_from(ego_coords[i,:])
@@ -1455,19 +1534,30 @@ def get_nth_yaw_deriv(track_uuid, n, log_dir, coordinate_frame=None, in_degrees=
     The returned angle is yaw measured from the x-axis of the track coordinate frame to the x-axis
     of the source coordinate frame"""
 
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
     ego_poses = get_ego_SE3(log_dir)
 
     # Filter the DataFrame
     cuboid_df = df[df['track_uuid'] == track_uuid]
-    cuboid_list = CuboidList.from_dataframe(cuboid_df)
 
-    self_to_ego_list:list[SE3] = []
+    # Synthetic ego fallback: when the annotation feather has no ego row,
+    # the ego-in-ego transform is the identity. Build self_to_ego_list as
+    # identity SE3s over the full pose-trajectory timeline so yaw derivatives
+    # reflect the city_SE3_egovehicle rotation directly.
+    if cuboid_df.empty and (track_uuid == get_ego_uuid(log_dir) or track_uuid == 'ego'):
+        pose_timestamps = sorted(ego_poses.keys())
+        timestamps = np.array(pose_timestamps, dtype=np.int64)
+        identity = SE3(rotation=np.eye(3), translation=np.zeros(3))
+        self_to_ego_list = [identity for _ in pose_timestamps]
+    else:
+        cuboid_list = CuboidList.from_dataframe(cuboid_df)
 
-    for i in range(len(cuboid_list)):
-        self_to_ego_list.append(cuboid_list[i].dst_SE3_object)
+        self_to_ego_list:list[SE3] = []
 
-    timestamps = cuboid_df['timestamp_ns'].to_numpy()
+        for i in range(len(cuboid_list)):
+            self_to_ego_list.append(cuboid_list[i].dst_SE3_object)
+
+        timestamps = cuboid_df['timestamp_ns'].to_numpy()
     self_to_city_list = []
     for i in range(len(self_to_ego_list)):
         self_to_city_list.append(ego_poses[timestamps[i]].compose(self_to_ego_list[i]))
@@ -1667,8 +1757,8 @@ def dilate_convex_polygon(points, distance):
 
 @cache_manager.create_cache('get_cuboid_from_uuid')
 def get_cuboid_from_uuid(track_uuid, log_dir, timestamp = None):
-    df = read_feather(log_dir / 'sm_annotations.feather')
-    
+    df = read_feather(log_dir / 'annotations.feather')
+
     track_df = df[df["track_uuid"] == track_uuid]
 
     if timestamp:
@@ -1677,7 +1767,7 @@ def get_cuboid_from_uuid(track_uuid, log_dir, timestamp = None):
             return None
 
     track_cuboids = CuboidList.from_dataframe(track_df)
-    
+
     return track_cuboids[0]
 
 
@@ -1692,7 +1782,7 @@ def to_scenario_dict(object_datastructure, log_dir)->dict:
         object_dict = {object_datastructure: unwrap_func(get_object)(object_datastructure, log_dir)}
     elif isinstance(object_datastructure, int):
         timestamp = object_datastructure
-        df = read_feather(log_dir / 'sm_annotations.feather')
+        df = read_feather(log_dir / 'annotations.feather')
         timestamp_df = df[df['timestamp_ns'] == timestamp]
 
         if timestamp_df.empty:
@@ -1704,7 +1794,7 @@ def to_scenario_dict(object_datastructure, log_dir)->dict:
               timestamp, or dict[timestamp:list[timestamp]]')
         print('Comparing to all objects in the log.')
 
-        df = read_feather(log_dir / 'sm_annotations.feather')
+        df = read_feather(log_dir / 'annotations.feather')
         all_uuids = df['track_uuid'].unique()
         object_dict, _ = parallelize_uuids(get_object, all_uuids, log_dir)
     
@@ -1870,7 +1960,7 @@ def dilate_timestamps(scenario, log_dir, min_timespan_s:float=1.5, log_df = None
 
 
     if log_df is None:
-        log_df = read_feather(log_dir / 'sm_annotations.feather')
+        log_df = read_feather(log_dir / 'annotations.feather')
 
     timestamps = sorted(log_df['timestamp_ns'].unique())
     timestep_s = 1E-9*(timestamps[1]-timestamps[0])
@@ -1994,7 +2084,7 @@ def at_stop_sign_(track_uuid, stop_sign_uuids, log_dir, forward_thresh=10) -> tu
 @composable
 def occluded(track_uuid, log_dir):
 
-    annotations_df = read_feather(log_dir / 'sm_annotations.feather')
+    annotations_df = read_feather(log_dir / 'annotations.feather')
     track_df = annotations_df[annotations_df['track_uuid'] == track_uuid]
     track_when_occluded = track_df[track_df['num_interior_pts'] == 0]
 
@@ -2276,7 +2366,7 @@ def get_objects_of_prompt(log_dir, prompt):
     return to_scenario_dict(get_uuids_of_prompt(log_dir, prompt), log_dir)
 
 def get_uuids_of_prompt(log_dir, prompt):
-    df = read_feather(log_dir / 'sm_annotations.feather')
+    df = read_feather(log_dir / 'annotations.feather')
 
     if prompt == 'ANY':
         uuids = df['track_uuid'].unique()
@@ -2296,7 +2386,7 @@ def create_mining_pkl(description, scenario, log_dir:Path, output_dir:Path):
     frames = []
     (output_dir / log_id).mkdir(exist_ok=True)
     
-    annotations = read_feather(log_dir / 'sm_annotations.feather')
+    annotations = read_feather(log_dir / 'annotations.feather')
     all_uuids = list(annotations['track_uuid'].unique())
     ego_poses = get_ego_SE3(log_dir)
 

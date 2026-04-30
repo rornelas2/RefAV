@@ -325,7 +325,7 @@ def at_pedestrian_crossing(
 
 
 def on_lane_type(
-    track_uuid:dict,
+    track_candidates:dict,
     log_dir,
     lane_type:Literal["BUS", "VEHICLE", "BIKE"])->dict:
     """
@@ -345,7 +345,7 @@ def on_lane_type(
 
 
 def near_intersection(
-    track_uuid:dict,
+    track_candidates:dict,
     log_dir:Path,
     threshold:float=5)->dict:
     """
@@ -414,15 +414,17 @@ def being_crossed_by(
 
 
 def near_objects(
-    track_uuid:dict,
-    candidate_uuids:dict,
+    track_candidates:dict,
+    related_candidates:dict,
     log_dir:Path,
     distance_thresh:float=10,
     min_objects:int=1,
     include_self:bool=False)->dict:
     """
     Identifies timestamps when a tracked object is near a specified set of related objects.
-    
+    IMPORTANT: always call with positional arguments — near_objects(tracks, candidates, log_dir, ...).
+    Do NOT use keyword arguments; the runtime wrapper requires positional binding.
+
     Args:
         track_candidates: Tracks to analyze (scenario dictionary).
         related_candidates: Candidates to check for proximity (scenario dictionary).
@@ -442,8 +444,8 @@ def near_objects(
 
 
 def following(
-    track_uuid:dict,
-    candidate_uuids:dict,
+    track_candidates:dict,
+    related_candidates:dict,
     log_dir:Path) -> dict:
     """
     Returns timestamps when the tracked object is following a lead object.
@@ -659,6 +661,101 @@ def scenario_not(func):
     """
 
 
+def is_snowy_scene(
+    track_candidates: dict,
+    log_dir: Path,
+    camera_name: str = "ring_front_center",
+    snow_score_thresh: float = 0.58,
+) -> dict:
+    """
+    Returns timestamps where the surrounding camera imagery looks visually snowy.
+
+    Args:
+        track_candidates: The objects you want to filter from (scenario dictionary).
+        log_dir: Path to scenario logs.
+        camera_name: Camera used to estimate snowiness.
+        snow_score_thresh: Minimum snow score for keeping a timestamp.
+
+    Returns:
+        dict: A filtered scenario dictionary of timestamps whose scene imagery has a high snow score.
+
+    Example:
+        ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+        ego_in_snow = is_snowy_scene(ego, log_dir)
+    """
+
+
+def within_camera_view(
+    track_candidates: dict,
+    log_dir: Path,
+    camera_name: str,
+) -> dict:
+    """
+    Returns objects that are within view of the specified camera.
+
+    Args:
+        track_candidates: The objects you want to filter from (scenario dictionary).
+        log_dir: Path to scenario logs.
+        camera_name: Name of the camera. Valid values: 'ring_front_center',
+            'ring_front_left', 'ring_front_right', 'ring_rear_left',
+            'ring_rear_right', 'ring_side_left', 'ring_side_right'.
+
+    Returns:
+        dict: A filtered scenario dictionary containing only objects within camera view.
+
+    Example:
+        vehicles_ahead = within_camera_view(vehicles, log_dir, camera_name='ring_front_center')
+    """
+
+
+def union(source_dict: dict, related_dict: dict, log_dir: Path) -> dict:
+    """Merge two flat scenario dicts by taking the union of all tracks and their timestamps.
+
+    Use this to express OR conditions between two parallel filter chains, e.g. vehicles
+    that are EITHER turning OR accelerating. Both inputs must be flat scenario dicts
+    (output of unary filter operations). Do NOT pass relational (nested) dicts.
+
+    Args:
+        source_dict: First scenario dictionary mapping track_uuid to [timestamp_ns, ...].
+        related_dict: Second scenario dictionary mapping track_uuid to [timestamp_ns, ...].
+        log_dir: Path to scenario logs (unused; kept for API consistency).
+
+    Returns:
+        dict: Merged scenario dictionary.
+
+    Example:
+        turning_or_accelerating = union(turning_vehicles, accelerating_vehicles, log_dir)
+    """
+
+
+def within_time_window(
+    track_candidates: dict,
+    log_dir: Path,
+    window_seconds: float = 15.0,
+    min_events: int = 2,
+    event_gap_seconds: float = 0.5,
+) -> dict:
+    """
+    Keep tracks whose upstream-filtered timestamps form at least `min_events`
+    distinct event segments whose start times all fall within `window_seconds`
+    of each other. Use for prompts like "two right turns within 15 seconds":
+    pipe the event filter (turning, accelerating, ...) as source, then apply
+    this op to require repetition inside a temporal window.
+
+    Args:
+        track_candidates: flat scenario dict from an upstream unary filter.
+        log_dir: log directory (unused, kept for DSL uniformity).
+        window_seconds: max time span between the first and last event starts.
+        min_events: number of distinct event segments required.
+        event_gap_seconds: gap (s) separating two distinct event segments.
+
+    Example:
+        ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+        right_turns = turning(ego, log_dir, direction='right')
+        two_rights_in_15s = within_time_window(right_turns, log_dir, window_seconds=15, min_events=2)
+    """
+
+
 def output_scenario(
     scenario:dict,
     description:str,
@@ -667,5 +764,5 @@ def output_scenario(
     visualize:bool=False,
     **visualization_kwargs):
     """
-    Outputs a file containing the predictions in an evaluation-ready format. Do not provide any visualization kwargs. 
+    Outputs a file containing the predictions in an evaluation-ready format. Do not provide any visualization kwargs.
     """

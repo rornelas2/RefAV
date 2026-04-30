@@ -15,7 +15,7 @@ output_scenario(lane_changes, description, log_dir, output_dir)
 ```
 ```python
 description = 'accelerating to the side'
-all_objects = get_objects_of_category(log_dir, category=”ANY)
+all_objects = get_objects_of_category(log_dir, category=”ANY”)
 accel = scenario_not(has_lateral_acceleration)(all_objects, log_dir, min_accel=-1, max_accel=1)
 output_scenario(accel, description, log_dir, output_dir)
 ```
@@ -86,12 +86,12 @@ vehicles_in_same_lane = in_same_lane(vehicles, vehicles, log_dir)
 output_scenario(vehicles_in_same_lane, description, log_dir, output_dir)
 ```
 ```python
-description = 'ego vehicle being overtaken on right by a semi'
-vehicles = get_objects_of_category(log_dir, category=’EGO_VEHICLE’)
+description = ‘ego vehicle being overtaken on right by a semi’
+ego = get_objects_of_category(log_dir, category=’EGO_VEHICLE’)
 semi = get_objects_of_category(log_dir, category=’TRUCK_CAB’)
-moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+moving_ego = scenario_not(stationary)(ego, log_dir)
 #defining overtaking to be within 10m of the front and back of the vehicle
-overtaken_on_right = being_crossed_by(moving_vehicles, truck_cab, log_dir, direction='right', forward_thresh=5, lateral_thresh=10)
+overtaken_on_right = being_crossed_by(moving_ego, semi, log_dir, direction=’right’, forward_thresh=5, lateral_thresh=10)
 output_scenario(overtaken_on_right, description, log_dir, output_dir)
 ```
 ```python
@@ -117,4 +117,195 @@ motorcycle_in_lane_to_right = in_same_lane(active_motocycles, vehicles_left_of_m
 lane_splitting_motorcycles = scenario_or([has_objects_in_relative_direction(motorcycle_in_lane_to_left, vehicles_left_of_motorcycle, log_dir, direction='left', within_distance=4, lateral_thresh=2),
   has_objects_in_relative_direction(motorcycle_in_lane_to_right, vehicles_right_of_motorcycle, log_dir, direction='right', within_distance=4, lateral_thresh=2)])
 output_scenario(lane_splitting_motorcycles, description, log_dir, output_dir)
+```
+```python
+# Use accelerating() with negative thresholds to detect braking.
+# The docstring says values under -1 reliably indicate braking.
+# has_lateral_acceleration() measures side-to-side jerk and must NOT be used for braking.
+description = 'vehicle braking hard'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+braking_vehicles = accelerating(moving_vehicles, log_dir, min_accel=-np.inf, max_accel=-1.0)
+output_scenario(braking_vehicles, description, log_dir, output_dir)
+```
+```python
+# at_stop_sign() checks whether a vehicle is in the lane that leads to a stop sign,
+# within forward_thresh metres. Pair with stationary() to require the vehicle to be stopped.
+description = 'vehicle stopped at a stop sign'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+near_stop_sign = at_stop_sign(vehicles, log_dir, forward_thresh=12)
+stopped_at_stop_sign = stationary(near_stop_sign, log_dir)
+output_scenario(stopped_at_stop_sign, description, log_dir, output_dir)
+```
+```python
+# Truck without trailer: TRUCK_CAB (semi cab) is the tractor unit; VEHICULAR_TRAILER is separate.
+# A TRUCK_CAB not accompanied by a VEHICULAR_TRAILER to its rear counts as "without trailer".
+description = 'truck without trailer'
+trailers = get_objects_of_category(log_dir, category='VEHICULAR_TRAILER')
+truck_cabs = get_objects_of_category(log_dir, category='TRUCK_CAB')
+# Keep cabs that do NOT have a trailer close behind them
+cabs_without_trailer = scenario_not(has_objects_in_relative_direction)(truck_cabs, trailers, log_dir,
+                                                                        direction='backward', within_distance=8)
+output_scenario(cabs_without_trailer, description, log_dir, output_dir)
+```
+```python
+# Detecting a vehicle two cars ahead: chain get_objects_in_relative_direction twice.
+# First find the vehicle directly ahead, then find the vehicle ahead of *that* vehicle.
+description = 'vehicle two cars ahead is braking'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+# Vehicle directly in front of ego
+one_ahead = get_objects_in_relative_direction(ego, moving_vehicles, log_dir,
+                                               direction='forward', min_number=1, max_number=1, within_distance=30)
+# Vehicle directly in front of that vehicle (two ahead of ego)
+two_ahead = get_objects_in_relative_direction(one_ahead, moving_vehicles, log_dir,
+                                               direction='forward', min_number=1, max_number=1, within_distance=30)
+braking_two_ahead = accelerating(two_ahead, log_dir, min_accel=-np.inf, max_accel=-1.0)
+output_scenario(braking_two_ahead, description, log_dir, output_dir)
+```
+```python
+# Overtaking (being passed): another vehicle crosses the lateral midplane of the subject.
+# direction='right' means the overtaking vehicle passes on the subject's right side.
+description = 'vehicle being overtaken on the right'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+overtaken_on_right = being_crossed_by(moving_vehicles, moving_vehicles, log_dir,
+                                       direction='right', forward_thresh=5, lateral_thresh=10)
+output_scenario(overtaken_on_right, description, log_dir, output_dir)
+```
+```python
+# "group of pedestrians" = use reverse_relationship(near_objects) to find a pedestrian
+# that has at least N other pedestrians nearby. Do NOT AND with extra spatial filters
+# or the result will be empty — start loose then tighten only if too many results.
+description = 'group of pedestrians ahead of the ego vehicle'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+peds = get_objects_of_category(log_dir, category='PEDESTRIAN')
+# A pedestrian that has >= 2 other pedestrians within 5m qualifies as "group"
+grouped_peds = reverse_relationship(near_objects)(peds, peds, log_dir, min_objects=2, within_distance=5)
+# Keep only those pedestrians in front of the ego vehicle
+peds_ahead = get_objects_in_relative_direction(ego, grouped_peds, log_dir,
+                                                direction='forward', within_distance=50)
+output_scenario(peds_ahead, description, log_dir, output_dir)
+```
+```python
+# Stopped vehicles at an intersection being crossed by pedestrians.
+# being_crossed_by() identifies the VEHICLE that pedestrians walk across.
+description = 'stopped vehicles at intersection being crossed by pedestrians'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+peds = get_objects_of_category(log_dir, category='PEDESTRIAN')
+stopped_vehicles = stationary(vehicles, log_dir)
+vehicles_at_intersection = near_intersection(stopped_vehicles, log_dir)
+crossed_vehicles = being_crossed_by(vehicles_at_intersection, peds, log_dir, forward_thresh=5, lateral_thresh=5)
+output_scenario(crossed_vehicles, description, log_dir, output_dir)
+```
+```python
+# Vehicle directly facing a moving pedestrian within a distance range.
+# facing_toward() checks if the object's heading points toward the related object.
+description = 'vehicle directly facing a moving pedestrian from 5-15 meters away'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+peds = get_objects_of_category(log_dir, category='PEDESTRIAN')
+moving_peds = scenario_not(stationary)(peds, log_dir)
+# Vehicles whose heading points toward a moving pedestrian 5-15m away
+facing_vehicles = facing_toward(vehicles, moving_peds, log_dir, within_angle=30, max_distance=15)
+vehicles_close_enough = has_objects_in_relative_direction(facing_vehicles, moving_peds, log_dir,
+                                                           direction='forward', within_distance=15)
+output_scenario(facing_vehicles, description, log_dir, output_dir)
+```
+```python
+# Temporal repetition within a window: use within_time_window() after an event filter.
+# This handles "two X within N seconds" patterns.
+description = 'ego vehicle making two right turns within 15 seconds'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+right_turns = turning(ego, log_dir, direction='right')
+two_rights_in_15s = within_time_window(right_turns, log_dir, window_seconds=15, min_events=2)
+output_scenario(two_rights_in_15s, description, log_dir, output_dir)
+```
+```python
+# Snow/weather scene detection: is_snowy_scene() filters timestamps by visual snow score.
+description = 'ego vehicle driving during snow'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+ego_in_snow = is_snowy_scene(ego, log_dir)
+output_scenario(ego_in_snow, description, log_dir, output_dir)
+```
+```python
+# Vehicle accelerating toward a pedestrian crossing: combine heading_toward with at_pedestrian_crossing.
+# Do NOT AND too many conditions — each AND risks producing EMPTY. Stay loose.
+description = 'vehicle accelerating towards pedestrian crossing'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+peds = get_objects_of_category(log_dir, category='PEDESTRIAN')
+peds_at_crossing = at_pedestrian_crossing(peds, log_dir, within_distance=3)
+# Vehicles that are approaching (heading toward) a pedestrian crossing area
+vehicles_near_crossing = near_objects(vehicles, peds_at_crossing, log_dir, within_distance=30)
+accelerating_vehicles = accelerating(vehicles_near_crossing, log_dir, min_accel=0.5)
+output_scenario(accelerating_vehicles, description, log_dir, output_dir)
+```
+```python
+# Motorcycle or bicycle between two vehicles: use has_objects_in_relative_direction on both sides.
+description = 'motorcycle between two vehicles'
+motorcycles = get_objects_of_category(log_dir, category='MOTORCYCLE')
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+# Motorcycle with a vehicle to its left AND to its right
+moto_with_left = has_objects_in_relative_direction(motorcycles, vehicles, log_dir,
+                                                    direction='left', within_distance=6, lateral_thresh=3)
+moto_sandwiched = has_objects_in_relative_direction(moto_with_left, vehicles, log_dir,
+                                                     direction='right', within_distance=6, lateral_thresh=3)
+output_scenario(moto_sandwiched, description, log_dir, output_dir)
+```
+```python
+# When the description refers to ONE specific object ("the vehicle ahead", "the bus behind"),
+# use max_number=1 in get_objects_in_relative_direction to return only the nearest candidate.
+# This prevents picking the wrong track when multiple objects match the description.
+description = 'vehicle directly ahead of the ego vehicle'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+# max_number=1 returns only the single closest vehicle in front — avoids ambiguous multi-track output
+lead_vehicle = get_objects_in_relative_direction(ego, vehicles, log_dir,
+                                                  direction='forward', max_number=1, within_distance=40)
+output_scenario(lead_vehicle, description, log_dir, output_dir)
+```
+```python
+# "Vehicle following X" pattern: chain two get_objects_in_relative_direction calls.
+# First find the anchor object (the one being followed), then find the follower behind it.
+# Use max_number=1 at each step to uniquely identify the specific referred objects.
+description = 'ego vehicle following a vehicle being overtaken on the right'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+# Step 1: find the vehicle being overtaken (a moving vehicle being crossed from the right)
+overtaken = being_crossed_by(moving_vehicles, moving_vehicles, log_dir,
+                              direction='right', forward_thresh=5, lateral_thresh=10)
+# Step 2: find the ego when it is directly behind the overtaken vehicle (max_number=1 = the nearest)
+ego_following = get_objects_in_relative_direction(overtaken, ego, log_dir,
+                                                   direction='behind', max_number=1, within_distance=25)
+output_scenario(ego_following, description, log_dir, output_dir)
+```
+```python
+# "Vehicle N cars ahead/behind": chain get_objects_in_relative_direction with max_number=1
+# at every step so each link in the chain uniquely identifies one specific vehicle.
+description = 'the vehicle two cars behind the ego vehicle'
+ego = get_objects_of_category(log_dir, category='EGO_VEHICLE')
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+moving_vehicles = scenario_not(stationary)(vehicles, log_dir)
+# Vehicle immediately behind ego (1 car back)
+one_back = get_objects_in_relative_direction(ego, moving_vehicles, log_dir,
+                                              direction='behind', max_number=1, within_distance=30)
+# Vehicle behind that vehicle (2 cars back)
+two_back = get_objects_in_relative_direction(one_back, moving_vehicles, log_dir,
+                                              direction='behind', max_number=1, within_distance=30)
+output_scenario(two_back, description, log_dir, output_dir)
+```
+```python
+# Reverse-perspective lookup: when the description says "vehicle X near/behind/beside Y",
+# start from Y and find X relative to it rather than scanning all X for proximity to Y.
+# This often resolves ambiguity when there are many X candidates in the scene.
+description = 'vehicle stopped behind a pedestrian crossing'
+vehicles = get_objects_of_category(log_dir, category='VEHICLE')
+peds = get_objects_of_category(log_dir, category='PEDESTRIAN')
+stopped_vehicles = stationary(vehicles, log_dir)
+peds_at_crossing = at_pedestrian_crossing(peds, log_dir)
+# Find stopped vehicles with a pedestrian crossing directly ahead — uniquely identifies the stopped car
+vehicle_behind_crossing = has_objects_in_relative_direction(stopped_vehicles, peds_at_crossing, log_dir,
+                                                             direction='forward', within_distance=10)
+output_scenario(vehicle_behind_crossing, description, log_dir, output_dir)
 ```
